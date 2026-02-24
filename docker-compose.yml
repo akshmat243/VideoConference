@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  signaling-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - JWT_SECRET_KEY=super_secure_production_key_here
+    restart: always
+
+  # Coturn STUN/TURN Server for NAT Traversal
+  coturn:
+    image: coturn/coturn
+    network_mode: "host"
+    command: >
+      -n
+      --log-file=stdout
+      --min-port=49152
+      --max-port=65535
+      --realm=yourdomain.com
+      --use-auth-secret
+      --static-auth-secret=your_secure_turn_secret
+      # Replace EXTERNAL_IP with your server's public IP
+      # --external-ip=YOUR_PUBLIC_IP
+    restart: always
