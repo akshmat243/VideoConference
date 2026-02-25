@@ -3,41 +3,35 @@ const conferenceScreen = document.getElementById('conference-screen');
 const joinBtn = document.getElementById('join-btn');
 const roomIdInput = document.getElementById('room-id');
 const usernameInput = document.getElementById('username');
-const roomTitle = document.getElementById('room-title');
+const userRoleSelect = document.getElementById('user-role');
+const sessionTitle = document.getElementById('session-title');
 const localVideo = document.getElementById('local-video');
-const videoGrid = document.getElementById('video-grid');
+const remoteVideo = document.getElementById('remote-video');
+const remoteLabel = document.getElementById('remote-label');
+const agentControls = document.getElementById('agent-controls');
+const captureGallery = document.getElementById('capture-gallery');
 
-// Controls
 const toggleAudioBtn = document.getElementById('toggle-audio-btn');
 const toggleVideoBtn = document.getElementById('toggle-video-btn');
-const shareScreenBtn = document.getElementById('share-screen-btn');
 const leaveBtn = document.getElementById('leave-btn');
 
-// Chat
 const chatBox = document.getElementById('chat-box');
 const chatInput = document.getElementById('chat-message');
 const sendChatBtn = document.getElementById('send-chat-btn');
 
 let localStream;
-let screenStream;
 let ws;
 let roomId;
 let clientId;
 let username;
+let userRole;
+let peerConnection;
+let accessToken = ""; // In real React app, this comes from login state
 
-// Peer Connections: peerId -> RTCPeerConnection
-const peerConnections = {};
-
-// ICE Servers (Google's public STUN server for NAT traversal)
-// In production, add a TURN server here (e.g., Coturn)
 const rtcConfig = {
-    iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-    ]
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
 };
 
-// Generate a random ID
 function generateId() {
     return Math.random().toString(36).substring(2, 15);
 }
@@ -45,28 +39,37 @@ function generateId() {
 joinBtn.addEventListener('click', async () => {
     roomId = roomIdInput.value.trim();
     username = usernameInput.value.trim();
+    userRole = userRoleSelect.value;
+    
     if (!roomId || !username) {
-        alert("Please enter both Room ID and Username.");
+        alert("Please enter Room ID and Name.");
         return;
     }
 
     clientId = generateId();
-    roomTitle.innerText = `Room: ${roomId}`;
+    sessionTitle.innerText = `KYC Session: ${roomId} (${userRole})`;
 
     try {
-        // Get local media
+        // MOCK LOGIN FOR STATIC DEMO (Real React app calls /api/auth/login)
+        // For static demo to work with Secure WS, we need a valid token.
+        // I'll assume the user uses Swagger to get a token and we prompt for it here for demo purposes.
+        accessToken = prompt("Please enter your JWT Token (obtained from Swagger /api/auth/login or /api/verify/mobile/verify):");
+        if (!accessToken) return;
+
         localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         localVideo.srcObject = localStream;
         
-        // Switch UI
         joinScreen.classList.add('hidden');
         conferenceScreen.classList.remove('hidden');
 
-        // Connect WebSocket
+        if (userRole === 'agent') {
+            agentControls.classList.remove('hidden');
+        }
+
         connectWebSocket();
     } catch (err) {
-        console.error("Error accessing media devices.", err);
-        alert("Could not access camera/microphone.");
+        console.error("Media access error:", err);
+        alert("Camera/Mic access denied or Token missing.");
     }
 });
 
@@ -75,61 +78,33 @@ function connectWebSocket() {
     const host = window.location.hostname;
     const port = window.location.port ? `:${window.location.port}` : '';
     
-    // Safety: Encode components to prevent URL breakages
-    const encodedRoom = encodeURIComponent(roomId);
-    const encodedClient = encodeURIComponent(clientId);
+    // SECURE: Passing token in query parameter for WebSocket auth
+    const wsUrl = `${protocol}//${host}${port}/ws/${roomId}/${clientId}?token=${accessToken}`;
     
-    const wsUrl = `${protocol}//${host}${port}/ws/${encodedRoom}/${encodedClient}`;
-    
-    console.log(`[WS] Attempting connection: ${wsUrl}`);
-    
-    if (ws) {
-        ws.close();
-    }
-
+    console.log(`[WS] Connecting to ${wsUrl}`);
     ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-        console.log("[WS] Connection successful!");
-    };
-
-    ws.onclose = (event) => {
-        console.warn(`[WS] Disconnected. Code: ${event.code}, Reason: ${event.reason}`);
-        // Only show alert if it wasn't a manual leave
-        if (event.code !== 1000) {
-            alert("Connection lost. Please check if the server is running.");
-            leaveRoom();
-        }
-    };
-
-    ws.onerror = (error) => {
-        console.error("[WS] Error observed:", error);
-    };
 
     ws.onmessage = async (event) => {
         const message = JSON.parse(event.data);
-        const peerId = message.peerId;
-
+        
         switch (message.type) {
-            case 'new-peer':
-                console.log("New peer joined:", peerId);
-                // Create an offer to the new peer
-                await createPeerConnection(peerId, true);
+            case 'peer-joined':
+                remoteLabel.innerText = "Peer Connected";
+                initPeerConnection(true);
                 break;
             case 'offer':
-                console.log("Received offer from:", peerId);
-                await handleOffer(message, peerId);
+                await handleOffer(message.sdp);
                 break;
             case 'answer':
-                console.log("Received answer from:", peerId);
-                await handleAnswer(message, peerId);
+                await handleAnswer(message.sdp);
                 break;
             case 'ice-candidate':
-                await handleIceCandidate(message, peerId);
+                if (peerConnection) await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
                 break;
             case 'peer-left':
-                console.log("Peer left:", peerId);
-                removePeer(peerId);
+                remoteLabel.innerText = "Peer Disconnected";
+                if (peerConnection) peerConnection.close();
+                remoteVideo.srcObject = null;
                 break;
             case 'chat':
                 appendChatMessage(message.username, message.text, false);
@@ -137,231 +112,86 @@ function connectWebSocket() {
         }
     };
 
-    ws.onclose = () => {
-        console.log("WebSocket disconnected.");
-        leaveRoom();
+    ws.onclose = (e) => {
+        console.error("WS Closed:", e.reason);
+        alert("Connection Closed: " + e.reason);
+        location.reload();
     };
 }
 
-async function createPeerConnection(peerId, isInitiator) {
-    const pc = new RTCPeerConnection(rtcConfig);
-    peerConnections[peerId] = pc;
+async function initPeerConnection(isInitiator) {
+    peerConnection = new RTCPeerConnection(rtcConfig);
+    localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
-    // Add local tracks to connection
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    peerConnection.ontrack = (event) => {
+        remoteVideo.srcObject = event.streams[0];
+    };
 
-    // Handle ICE candidates generated by the local WebRTC stack
-    pc.onicecandidate = (event) => {
+    peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
-            ws.send(JSON.stringify({
-                type: 'ice-candidate',
-                targetPeer: peerId,
-                candidate: event.candidate
-            }));
+            ws.send(JSON.stringify({ type: 'ice-candidate', candidate: event.candidate }));
         }
     };
 
-    // Handle remote tracks received
-    pc.ontrack = (event) => {
-        const remoteStream = event.streams[0];
-        addRemoteVideo(peerId, remoteStream);
-    };
-
-    // If we are the initiator, create and send an offer
     if (isInitiator) {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        ws.send(JSON.stringify({
-            type: 'offer',
-            targetPeer: peerId,
-            sdp: pc.localDescription
-        }));
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', sdp: peerConnection.localDescription }));
     }
-
-    return pc;
 }
 
-async function handleOffer(message, peerId) {
-    const pc = await createPeerConnection(peerId, false);
-    await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
-    
-    const answer = await pc.createAnswer();
+async function handleOffer(sdp) {
+    if (!peerConnection) initPeerConnection(false);
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await peerConnection.createAnswer();
     await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ type: 'answer', sdp: peerConnection.localDescription }));
+}
+
+async function handleAnswer(sdp) {
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+}
+
+// CAPTURE FEATURE (Calling Backend API)
+window.captureImage = async (label) => {
+    if (!remoteVideo.srcObject) {
+        alert("No remote video to capture!");
+        return;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = remoteVideo.videoWidth;
+    canvas.height = remoteVideo.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(remoteVideo, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/png');
     
-    ws.send(JSON.stringify({
-        type: 'answer',
-        targetPeer: peerId,
-        sdp: pc.localDescription
-    }));
-}
-
-async function handleAnswer(message, peerId) {
-    const pc = peerConnections[peerId];
-    if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
-    }
-}
-
-async function handleIceCandidate(message, peerId) {
-    const pc = peerConnections[peerId];
-    if (pc) {
-        try {
-            await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
-        } catch (e) {
-            console.error('Error adding received ice candidate', e);
-        }
-    }
-}
-
-function addRemoteVideo(peerId, stream) {
-    // Check if video element already exists
-    if (document.getElementById(`video-container-${peerId}`)) return;
-
-    const container = document.createElement('div');
-    container.id = `video-container-${peerId}`;
-    container.className = 'video-container';
-
-    const video = document.createElement('video');
-    video.id = `video-${peerId}`;
-    video.autoplay = true;
-    video.playsInline = true;
-    video.srcObject = stream;
-
-    const label = document.createElement('div');
-    label.className = 'label';
-    label.innerText = `Peer ${peerId.substring(0,4)}`; // Ideally map to username
-
-    container.appendChild(video);
-    container.appendChild(label);
-    videoGrid.appendChild(container);
-}
-
-function removePeer(peerId) {
-    if (peerConnections[peerId]) {
-        peerConnections[peerId].close();
-        delete peerConnections[peerId];
-    }
-    const container = document.getElementById(`video-container-${peerId}`);
-    if (container) {
-        container.remove();
-    }
-}
-
-function leaveRoom() {
-    // Close all peer connections
-    for (let peerId in peerConnections) {
-        removePeer(peerId);
-    }
-    // Stop local media
-    if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-    }
-    if (screenStream) {
-        screenStream.getTracks().forEach(track => track.stop());
-    }
-    // Close WebSocket
-    if (ws) ws.close();
-
-    // Reset UI
-    conferenceScreen.classList.add('hidden');
-    joinScreen.classList.remove('hidden');
-    
-    // Clear chat
-    chatBox.innerHTML = '';
-}
-
-// Media Controls
-toggleAudioBtn.addEventListener('click', () => {
-    const audioTrack = localStream.getAudioTracks()[0];
-    if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        toggleAudioBtn.innerText = audioTrack.enabled ? "Unmute Audio" : "Mute Audio";
-        toggleAudioBtn.classList.toggle('danger', !audioTrack.enabled);
-    }
-});
-
-toggleVideoBtn.addEventListener('click', () => {
-    const videoTrack = localStream.getVideoTracks()[0];
-    if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled;
-        toggleVideoBtn.innerText = videoTrack.enabled ? "Turn On Camera" : "Turn Off Camera";
-        toggleVideoBtn.classList.toggle('danger', !videoTrack.enabled);
-    }
-});
-
-shareScreenBtn.addEventListener('click', async () => {
     try {
-        if (!screenStream) {
-            screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-            const screenTrack = screenStream.getVideoTracks()[0];
-            
-            // Replace track in all peer connections
-            for (let peerId in peerConnections) {
-                const pc = peerConnections[peerId];
-                const sender = pc.getSenders().find(s => s.track.kind === 'video');
-                if (sender) {
-                    sender.replaceTrack(screenTrack);
-                }
-            }
-            
-            // Show locally
-            localVideo.srcObject = screenStream;
-            shareScreenBtn.innerText = "Stop Sharing";
-            shareScreenBtn.classList.add('active');
-
-            screenTrack.onended = stopScreenShare;
+        const response = await fetch('/api/session/capture', {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${accessToken}`
+            },
+            body: JSON.stringify({
+                room_id: roomId,
+                label: label,
+                image_data: dataUrl
+            })
+        });
+        
+        if (response.ok) {
+            const item = document.createElement('div');
+            item.className = 'capture-item';
+            item.innerHTML = `<img src="${dataUrl}"><p>${label} - Saved to DB</p>`;
+            captureGallery.prepend(item);
         } else {
-            stopScreenShare();
+            alert("Failed to save capture to server.");
         }
     } catch (err) {
-        console.error("Error sharing screen:", err);
+        console.error("Capture API error:", err);
     }
-});
-
-function stopScreenShare() {
-    if (screenStream) {
-        screenStream.getTracks().forEach(track => track.stop());
-        screenStream = null;
-        
-        const videoTrack = localStream.getVideoTracks()[0];
-        
-        // Restore local camera in peer connections
-        for (let peerId in peerConnections) {
-            const pc = peerConnections[peerId];
-            const sender = pc.getSenders().find(s => s.track.kind === 'video');
-            if (sender) {
-                sender.replaceTrack(videoTrack);
-            }
-        }
-        
-        // Restore locally
-        localVideo.srcObject = localStream;
-        shareScreenBtn.innerText = "Share Screen";
-        shareScreenBtn.classList.remove('active');
-    }
-}
-
-leaveBtn.addEventListener('click', leaveRoom);
-
-// Chat messaging
-sendChatBtn.addEventListener('click', sendChatMessage);
-chatInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') sendChatMessage();
-});
-
-function sendChatMessage() {
-    const text = chatInput.value.trim();
-    if (text && ws && ws.readyState === WebSocket.OPEN) {
-        const msg = {
-            type: 'chat',
-            username: username,
-            text: text
-        };
-        ws.send(JSON.stringify(msg));
-        appendChatMessage("You", text, true);
-        chatInput.value = '';
-    }
-}
+};
 
 function appendChatMessage(user, text, isSelf) {
     const div = document.createElement('div');
@@ -370,3 +200,28 @@ function appendChatMessage(user, text, isSelf) {
     chatBox.appendChild(div);
     chatBox.scrollTop = chatBox.scrollHeight;
 }
+
+sendChatBtn.addEventListener('click', () => {
+    const text = chatInput.value.trim();
+    if (text && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'chat', username: username, text: text }));
+        appendChatMessage("You", text, true);
+        chatInput.value = '';
+    }
+});
+
+toggleAudioBtn.addEventListener('click', () => {
+    const track = localStream.getAudioTracks()[0];
+    track.enabled = !track.enabled;
+    toggleAudioBtn.innerText = track.enabled ? "Mute Mic" : "Unmute Mic";
+});
+
+toggleVideoBtn.addEventListener('click', () => {
+    const track = localStream.getVideoTracks()[0];
+    track.enabled = !track.enabled;
+    toggleVideoBtn.innerText = track.enabled ? "Stop Camera" : "Start Camera";
+});
+
+leaveBtn.addEventListener('click', () => {
+    location.reload();
+});

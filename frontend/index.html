@@ -8,21 +8,38 @@
 </head>
 <body>
     <div id="join-screen">
-        <h2>Join Video Conference</h2>
-        <input type="text" id="room-id" placeholder="Room ID" value="demo-room">
-        <input type="text" id="username" placeholder="Your Name">
-        <button id="join-btn">Join Room</button>
+        <h2>Video KYC Portal</h2>
+        <div class="join-controls">
+            <input type="text" id="room-id" placeholder="Room ID" value="kyc-101">
+            <input type="text" id="username" placeholder="Your Name">
+            <select id="user-role">
+                <option value="customer">Customer</option>
+                <option value="agent">Agent</option>
+            </select>
+            <button id="join-btn">Start Session</button>
+        </div>
     </div>
 
     <div id="conference-screen" class="hidden">
         <div class="header">
-            <h2 id="room-title">Room: </h2>
+            <h2 id="session-title">KYC Session</h2>
+            <div id="agent-controls" class="hidden">
+                <button onclick="captureImage('Photo')" class="primary">Capture Photo</button>
+                <button onclick="captureImage('PAN')" class="primary">Capture PAN</button>
+                <button onclick="captureImage('Aadhar')" class="primary">Capture Aadhar</button>
+            </div>
         </div>
         
         <div class="main-content">
-            <div id="video-grid" class="video-grid">
-                <!-- Local video -->
-                <div class="video-container local">
+            <div class="kyc-grid">
+                <!-- Remote video (The person you are talking to) -->
+                <div class="video-container remote" id="remote-container">
+                    <video id="remote-video" autoplay playsinline></video>
+                    <div class="label" id="remote-label">Connecting...</div>
+                </div>
+
+                <!-- Local video (Self view) -->
+                <div class="video-container local" id="local-container">
                     <video id="local-video" autoplay muted playsinline></video>
                     <div class="label">You</div>
                 </div>
@@ -31,17 +48,20 @@
             <div class="sidebar">
                 <div id="chat-box" class="chat-box"></div>
                 <div class="chat-input">
-                    <input type="text" id="chat-message" placeholder="Type a message...">
+                    <input type="text" id="chat-message" placeholder="Chat with session...">
                     <button id="send-chat-btn">Send</button>
+                </div>
+                <div id="capture-gallery" class="capture-gallery">
+                    <h3>Captured Documents</h3>
+                    <!-- Captured images will appear here -->
                 </div>
             </div>
         </div>
 
         <div class="controls">
-            <button id="toggle-audio-btn">Mute Audio</button>
-            <button id="toggle-video-btn">Turn Off Camera</button>
-            <button id="share-screen-btn">Share Screen</button>
-            <button id="leave-btn" class="danger">Leave Room</button>
+            <button id="toggle-audio-btn">Mute Mic</button>
+            <button id="toggle-video-btn">Stop Camera</button>
+            <button id="leave-btn" class="danger">End KYC Call</button>
         </div>
     </div>
 
