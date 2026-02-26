@@ -20,3 +20,7 @@ Thumbs.db
 
 # Docker
 .docker/
+dockerignore
+documentation/
+backend/kyc_database.db
+*.db
