@@ -28,13 +28,17 @@ let userRole;
 let peerConnection;
 let accessToken = "";
 let iceCandidateQueue = [];
+let isInitializing = false;
 
 const rtcConfig = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' }
-    ]
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+    ],
+    iceCandidatePoolSize: 10
 };
 
 function generateId() {
@@ -81,6 +85,7 @@ function connectWebSocket() {
     const port = window.location.port ? `:${window.location.port}` : '';
     const wsUrl = `${protocol}//${host}${port}/ws/${roomId}/${clientId}?token=${accessToken}`;
     
+    console.log(`[WS] Connecting to ${wsUrl}`);
     ws = new WebSocket(wsUrl);
 
     ws.onmessage = async (event) => {
@@ -89,12 +94,15 @@ function connectWebSocket() {
         switch (message.type) {
             case 'peer-joined':
                 console.log("[P2P] Other peer joined. Initiating connection...");
-                await initPeerConnection(true);
+                if (!peerConnection && !isInitializing) await initPeerConnection(true);
                 break;
             case 'offer':
+                console.log("[P2P] Received offer.");
+                if (!peerConnection && !isInitializing) await initPeerConnection(false);
                 await handleOffer(message.sdp);
                 break;
             case 'answer':
+                console.log("[P2P] Received answer.");
                 await handleAnswer(message.sdp);
                 break;
             case 'ice-candidate':
@@ -120,46 +128,24 @@ function connectWebSocket() {
     };
 }
 
-function cleanupAndExit(notifyPeer = true) {
-    // 1. Notify the other person before I leave
-    if (notifyPeer && ws && ws.readyState === WebSocket.OPEN) {
-        try {
-            ws.send(JSON.stringify({ type: 'close-session' }));
-        } catch(e) {}
-    }
-
-    // 2. Kill hardware streams
-    if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-    }
-    
-    // 3. Set sources to null to stop "Freezing"
-    if (localVideo) localVideo.srcObject = null;
-    if (remoteVideo) remoteVideo.srcObject = null;
-    
-    // 4. Teardown connections
-    if (peerConnection) {
-        peerConnection.close();
-        peerConnection = null;
-    }
-    
-    // 5. Close socket and reset page
-    if (ws) ws.close();
-    location.reload(); 
-}
-
 async function initPeerConnection(isInitiator) {
-    if (peerConnection) return;
+    if (peerConnection || isInitializing) return;
+    isInitializing = true;
+    
+    console.log("[P2P] Initializing RTCPeerConnection...");
     peerConnection = new RTCPeerConnection(rtcConfig);
+    
     localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
     peerConnection.ontrack = (event) => {
+        console.log("[P2P] Remote track attached.");
         remoteVideo.srcObject = event.streams[0];
         remoteLabel.innerText = "Peer Connected";
+        remoteVideo.play().catch(e => {});
     };
 
     peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
+        if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'ice-candidate', candidate: event.candidate }));
         }
     };
@@ -169,10 +155,12 @@ async function initPeerConnection(isInitiator) {
         await peerConnection.setLocalDescription(offer);
         ws.send(JSON.stringify({ type: 'offer', sdp: peerConnection.localDescription }));
     }
+    
+    isInitializing = false;
 }
 
 async function handleOffer(sdp) {
-    await initPeerConnection(false);
+    if (!peerConnection) return;
     await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
     const answer = await peerConnection.createAnswer();
     await peerConnection.setLocalDescription(answer);
@@ -181,7 +169,7 @@ async function handleOffer(sdp) {
 }
 
 async function handleAnswer(sdp) {
-    if (peerConnection) {
+    if (peerConnection && !peerConnection.remoteDescription) {
         await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
         processQueuedCandidates();
     }
@@ -189,17 +177,45 @@ async function handleAnswer(sdp) {
 
 function handleRemoteCandidate(candidate) {
     if (peerConnection && peerConnection.remoteDescription && peerConnection.remoteDescription.type) {
-        peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => console.error(e));
+        peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => {});
     } else {
         iceCandidateQueue.push(candidate);
     }
 }
 
 function processQueuedCandidates() {
+    if (!peerConnection) return;
     while (iceCandidateQueue.length > 0) {
         const candidate = iceCandidateQueue.shift();
-        peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => console.error(e));
+        peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => {});
     }
+}
+
+function cleanupAndExit(notifyPeer = true) {
+    // 1. Blackout
+    if (localVideo) { localVideo.pause(); localVideo.srcObject = null; localVideo.load(); }
+    if (remoteVideo) { remoteVideo.pause(); remoteVideo.srcObject = null; remoteVideo.load(); }
+
+    // 2. Tracks
+    if (localStream) {
+        localStream.getTracks().forEach(track => { track.stop(); track.enabled = false; });
+    }
+
+    // 3. Notify & Wait
+    if (notifyPeer && ws && ws.readyState === WebSocket.OPEN) {
+        try {
+            ws.send(JSON.stringify({ type: 'close-session' }));
+        } catch(e) {}
+        setTimeout(() => finalizeCleanup(), 300);
+    } else {
+        finalizeCleanup();
+    }
+}
+
+function finalizeCleanup() {
+    if (peerConnection) { peerConnection.close(); peerConnection = null; }
+    if (ws) { ws.onclose = null; ws.close(); }
+    location.reload(); 
 }
 
 window.captureImage = async (label) => {
@@ -209,7 +225,6 @@ window.captureImage = async (label) => {
     const ctx = canvas.getContext('2d');
     ctx.drawImage(remoteVideo, 0, 0, canvas.width, canvas.height);
     const dataUrl = canvas.toDataURL('image/png');
-    
     try {
         const res = await fetch('/api/session/capture', {
             method: 'POST',
@@ -248,7 +263,6 @@ toggleAudioBtn.addEventListener('click', () => {
     const isEnabled = track.enabled;
     toggleAudioBtn.innerText = isEnabled ? "Mute Mic" : "Unmute Mic";
     toggleAudioBtn.classList.toggle('danger', !isEnabled);
-    
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'media-status', micEnabled: isEnabled }));
     }
@@ -261,7 +275,5 @@ toggleVideoBtn.addEventListener('click', () => {
 });
 
 leaveBtn.addEventListener('click', () => { 
-    if (confirm("End KYC Session?")) {
-        cleanupAndExit(true); // TRUE = tell other person to exit too
-    }
+    if (confirm("End KYC Session?")) cleanupAndExit(true);
 });

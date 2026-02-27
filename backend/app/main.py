@@ -221,11 +221,20 @@ async def ws_end(websocket: WebSocket, room_id: str, client_id: str, token: str 
         while True:
             data = await websocket.receive_text()
             m = json.loads(data)
-            if m.get("type") in ["offer", "answer", "ice-candidate"]: await manager.send_personal_message(m, room_id, t)
-            elif m.get("type") == "chat": await manager.broadcast(room_id, m, exclude_role=p["role"])
+            # RELAY: Offer, Answer, ICE, Mute status, and CLOSE signal
+            if m.get("type") in ["offer", "answer", "ice-candidate", "media-status", "close-session"]:
+                await manager.send_personal_message(m, room_id, t)
+            elif m.get("type") == "chat": 
+                await manager.broadcast(room_id, m, exclude_role=p["role"])
     except WebSocketDisconnect:
+        logger.info(f"Connection lost for {p.get('role')}")
         manager.disconnect(room_id, p.get("role", "customer"))
-    except: await websocket.close(code=1008)
+        # FORCE: Instantly tell the other side to KILL the session
+        await manager.send_personal_message({"type": "close-session"}, room_id, "agent" if p.get("role")=="customer" else "customer")
+    except Exception as e: 
+        logger.error(f"WS ERROR: {str(e)}")
+        manager.disconnect(room_id, p.get("role", "customer"))
+        await manager.send_personal_message({"type": "close-session"}, room_id, "agent" if p.get("role")=="customer" else "customer")
 
 # ----------------- 5. SUPPORT & ADMIN -----------------
 
