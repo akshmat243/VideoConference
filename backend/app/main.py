@@ -29,14 +29,27 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 tags_metadata = [
     {"name": "1. Authentication & Security", "description": "Registration, Set MPIN, and Secure Login."},
-    {"name": "2. Identity Verification (KYC)", "description": "Mobile, Aadhar, and PAN self-verification."},
+    {"name": "2. Identity Verification (KYC)", "description": "Mobile (with Resend), Aadhar, and PAN verification."},
     {"name": "3. Fintech Services", "description": "Apply for Accounts, Cards, and Loans via Video."},
     {"name": "4. Video KYC Orchestration", "description": "Manage live video queues and signaling."},
     {"name": "5. Support & Admin", "description": "Support tickets and Admin approval ops."},
 ]
 
-app = FastAPI(title="Video KYC Fintech Ultimate", version="10.0.0", openapi_tags=tags_metadata)
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+import traceback
+
+app = FastAPI(title="Video KYC Fintech Ultimate Pro", version="11.0.0", openapi_tags=tags_metadata)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# --- DEBUGGERS ---
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(status_code=422, content={"detail": "JSON Body Incorrect", "missing_or_wrong_fields": exc.errors()})
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error", "reason": str(exc)})
 
 # --- HELPERS ---
 def create_token(sub: str, role: str):
@@ -55,27 +68,38 @@ def get_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db))
 @app.post("/api/auth/agent/register", tags=["1. Authentication & Security"])
 async def register_agent(user: schemas.AgentRegister, db: Session = Depends(get_db)):
     """Register an Agent. Returns initial token for verification."""
+    # Check for duplicate unique fields
+    existing = db.query(models.User).filter(
+        (models.User.username == user.username) | 
+        (models.User.mobile_number == user.mobile_number) |
+        (models.User.aadhar_number == user.aadhar_number) |
+        (models.User.pan_number == user.pan_number)
+    ).first()
+    
+    if existing:
+        if existing.username == user.username: detail = "Username already taken"
+        elif existing.mobile_number == user.mobile_number: detail = "Mobile number already registered"
+        elif existing.aadhar_number == user.aadhar_number: detail = "Aadhar already registered"
+        else: detail = "PAN already registered"
+        raise HTTPException(status_code=400, detail=detail)
+
     hashed = pwd_context.hash(user.password[:50])
     new_user = models.User(username=user.username, mobile_number=user.mobile_number, aadhar_number=user.aadhar_number, pan_number=user.pan_number, role="agent", hashed_password=hashed)
     db.add(new_user); db.commit(); db.refresh(new_user)
-    return {"access_token": create_token(user.username, "agent"), "token_type": "bearer"}
+    return {"access_token": create_token(user.username, "agent"), "token_type": "bearer", "user_id": new_user.id}
 
 @app.post("/api/auth/set-mpin", tags=["1. Authentication & Security"])
 async def set_mpin(req: schemas.SetMPIN, current_user: models.User = Depends(get_user), db: Session = Depends(get_db)):
-    """Set numeric MPIN after identity verification."""
-    current_user.hashed_mpin = pwd_context.hash(req.mpin)
-    current_user.is_mpin_set = True
-    db.commit()
+    current_user.hashed_mpin = pwd_context.hash(req.mpin); current_user.is_mpin_set = True; db.commit()
     return {"message": "MPIN set successfully"}
 
 @app.post("/api/auth/login", response_model=schemas.Token, tags=["1. Authentication & Security"])
 async def login(req: schemas.UserLogin, db: Session = Depends(get_db)):
-    """Secure Login using Identifier + MPIN."""
     user = db.query(models.User).filter((models.User.username == req.identifier) | (models.User.mobile_number == req.identifier)).first()
     if not user or not user.is_mpin_set or not pwd_context.verify(req.mpin, user.hashed_mpin):
         raise HTTPException(401, "Invalid Credentials or MPIN")
     if user.role == "agent" and not user.is_admin_approved:
-        raise HTTPException(403, "Admin approval pending")
+        raise HTTPException(403, detail=f"Waiting for Admin Approval. Your Agent ID is: {user.id}")
     return {"access_token": create_token(user.username or user.mobile_number, user.role), "token_type": "bearer"}
 
 # ----------------- 2. IDENTITY VERIFICATION (KYC) -----------------
@@ -83,14 +107,23 @@ async def login(req: schemas.UserLogin, db: Session = Depends(get_db)):
 @app.post("/api/verify/mobile/request", tags=["2. Identity Verification (KYC)"])
 async def request_mobile_otp(req: schemas.MobileRequest, db: Session = Depends(get_db)):
     otp = str(random.randint(100000, 999999))
-    db.add(models.OTPTracker(identifier=req.mobile_number, otp_code=otp, expires_at=datetime.utcnow() + timedelta(minutes=5)))
+    db.add(models.OTPTracker(identifier=req.mobile_number, otp_code=otp, expires_at=datetime.utcnow() + timedelta(minutes=10)))
     db.commit(); logger.info(f"OTP: {otp}")
     return {"message": "OTP Sent"}
 
+@app.post("/api/verify/mobile/resend", tags=["2. Identity Verification (KYC)"])
+async def resend_mobile_otp(req: schemas.MobileRequest, db: Session = Depends(get_db)):
+    return await request_mobile_otp(req, db)
+
 @app.post("/api/verify/mobile/verify", tags=["2. Identity Verification (KYC)"])
 async def verify_mobile_otp(req: schemas.MobileVerify, db: Session = Depends(get_db)):
-    tracker = db.query(models.OTPTracker).filter(models.OTPTracker.identifier == req.mobile_number, models.OTPTracker.otp_code == req.otp).first()
-    if not tracker: raise HTTPException(400, "Invalid OTP")
+    tracker = db.query(models.OTPTracker).filter(models.OTPTracker.identifier == req.mobile_number, models.OTPTracker.otp_code == req.otp, models.OTPTracker.expires_at > datetime.utcnow()).first()
+    if not tracker: raise HTTPException(400, "Invalid or Expired OTP")
+    
+    # DUPLICATE CHECK: Mobile must not be verified by another person
+    dup = db.query(models.User).filter(models.User.mobile_number == req.mobile_number, models.User.is_mobile_verified == True).first()
+    if dup: raise HTTPException(400, detail="Mobile number already linked to another account")
+
     user = db.query(models.User).filter(models.User.mobile_number == req.mobile_number).first()
     if not user:
         user = models.User(mobile_number=req.mobile_number, is_mobile_verified=True, role="customer")
@@ -102,20 +135,28 @@ async def verify_mobile_otp(req: schemas.MobileVerify, db: Session = Depends(get
 @app.post("/api/verify/aadhar/request", tags=["2. Identity Verification (KYC)"])
 async def request_aadhar_otp(req: schemas.AadharRequest, current_user: models.User = Depends(get_user), db: Session = Depends(get_db)):
     otp = str(random.randint(100000, 999999))
-    db.add(models.OTPTracker(identifier=req.aadhar_number, otp_code=otp, expires_at=datetime.utcnow() + timedelta(minutes=5)))
-    db.commit(); logger.info(f"AADHAR OTP: {otp}")
-    return {"message": "OTP Sent"}
+    db.add(models.OTPTracker(identifier=req.aadhar_number, otp_code=otp, expires_at=datetime.utcnow() + timedelta(minutes=10)))
+    db.commit(); logger.info(f"OTP: {otp}")
+    return {"message": "Aadhar OTP Sent"}
 
 @app.post("/api/verify/aadhar/verify", tags=["2. Identity Verification (KYC)"])
 async def verify_aadhar_otp(req: schemas.AadharVerify, current_user: models.User = Depends(get_user), db: Session = Depends(get_db)):
-    tracker = db.query(models.OTPTracker).filter(models.OTPTracker.identifier == req.aadhar_number, models.OTPTracker.otp_code == req.otp).first()
-    if not tracker: raise HTTPException(400, "Invalid OTP")
+    # DUPLICATE CHECK
+    dup = db.query(models.User).filter(models.User.aadhar_number == req.aadhar_number, models.User.id != current_user.id).first()
+    if dup: raise HTTPException(400, detail="Aadhar number already linked to another account")
+
+    tracker = db.query(models.OTPTracker).filter(models.OTPTracker.identifier == req.aadhar_number, models.OTPTracker.otp_code == req.otp, models.OTPTracker.expires_at > datetime.utcnow()).first()
+    if not tracker: raise HTTPException(400, "Invalid or Expired OTP")
     current_user.aadhar_number, current_user.is_aadhar_verified = req.aadhar_number, True
     db.commit()
     return {"message": "Aadhar Verified"}
 
 @app.post("/api/verify/pan/verify", tags=["2. Identity Verification (KYC)"])
 async def verify_pan(req: schemas.PANVerify, current_user: models.User = Depends(get_user), db: Session = Depends(get_db)):
+    # DUPLICATE CHECK
+    dup = db.query(models.User).filter(models.User.pan_number == req.pan_number, models.User.id != current_user.id).first()
+    if dup: raise HTTPException(400, detail="PAN number already linked to another account")
+
     current_user.pan_number, current_user.is_pan_verified = req.pan_number, True
     db.commit()
     return {"message": "PAN Verified"}
@@ -138,7 +179,6 @@ async def apply_card(req: schemas.CardApply, u: models.User = Depends(get_user),
 async def apply_loan(req: schemas.LoanApply, u: models.User = Depends(get_user), db: Session = Depends(get_db)):
     room_id = f"loan-{uuid.uuid4().hex[:6]}"
     db.add(models.KYCSession(room_id=room_id, customer_id=u.id, service_type="LOAN_APPROVAL"))
-    # Pre-create loan entry
     db.add(models.LoanApplication(customer_id=u.id, amount=req.amount, purpose=req.purpose))
     db.commit(); return {"room_id": room_id}
 
@@ -149,13 +189,6 @@ async def block_card(req: schemas.CardBlock, u: models.User = Depends(get_user),
     db.commit(); return {"room_id": room_id}
 
 # ----------------- 4. VIDEO KYC ORCHESTRATION -----------------
-
-@app.post("/api/kyc/request", tags=["4. Video KYC Orchestration"])
-async def request_kyc(u: models.User = Depends(get_user), db: Session = Depends(get_db)):
-    room_id = f"kyc-{uuid.uuid4().hex[:6]}"
-    db.add(models.KYCSession(room_id=room_id, customer_id=u.id, service_type="KYC"))
-    u.video_kyc_status = "requested"
-    db.commit(); return {"room_id": room_id}
 
 @app.get("/api/kyc/pending", tags=["4. Video KYC Orchestration"])
 async def list_pending(db: Session = Depends(get_db)):
@@ -170,6 +203,9 @@ async def accept_kyc(room_id: str, u: models.User = Depends(get_user), db: Sessi
 @app.post("/api/session/capture", tags=["4. Video KYC Orchestration"])
 async def log_capture(capture: schemas.CaptureLog, db: Session = Depends(get_db)):
     s = db.query(models.KYCSession).filter(models.KYCSession.room_id == capture.room_id).first()
+    if not s:
+        s = models.KYCSession(room_id=capture.room_id, status="active")
+        db.add(s); db.commit(); db.refresh(s)
     db.add(models.Capture(session_id=s.id, label=capture.label, image_base64=capture.image_data))
     db.commit(); return {"status": "Saved"}
 
@@ -177,6 +213,9 @@ async def log_capture(capture: schemas.CaptureLog, db: Session = Depends(get_db)
 async def ws_end(websocket: WebSocket, room_id: str, client_id: str, token: str = Query(...)):
     try:
         p = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        db = next(get_db())
+        user = db.query(models.User).filter((models.User.username == p["sub"]) | (models.User.mobile_number == p["sub"])).first()
+        if not user or not user.is_mpin_set: await websocket.close(code=1008); return
         await manager.connect(websocket, room_id, client_id, p["role"])
         t = "customer" if p["role"] == "agent" else "agent"
         while True:
@@ -184,9 +223,15 @@ async def ws_end(websocket: WebSocket, room_id: str, client_id: str, token: str 
             m = json.loads(data)
             if m.get("type") in ["offer", "answer", "ice-candidate"]: await manager.send_personal_message(m, room_id, t)
             elif m.get("type") == "chat": await manager.broadcast(room_id, m, exclude_role=p["role"])
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, p.get("role", "customer"))
     except: await websocket.close(code=1008)
 
 # ----------------- 5. SUPPORT & ADMIN -----------------
+
+@app.get("/api/admin/all-users", tags=["5. Support & Admin"])
+async def list_all_users(db: Session = Depends(get_db)):
+    return db.query(models.User).all()
 
 @app.post("/api/admin/approve-agent", tags=["5. Support & Admin"])
 async def approve_ag(req: schemas.AdminApprove, db: Session = Depends(get_db)):
@@ -203,10 +248,10 @@ async def service_decision(req: schemas.ServiceDecision, db: Session = Depends(g
             db.add(models.Card(user_id=s.customer_id, card_number=f"4111-{random.randint(1000,9999)}-{random.randint(1000,9999)}", card_type="Debit"))
         elif s.service_type == "LOAN_APPROVAL":
             loan = db.query(models.LoanApplication).filter(models.LoanApplication.customer_id == s.customer_id).order_by(models.LoanApplication.id.desc()).first()
-            loan.status = "approved"
+            if loan: loan.status = "approved"
         elif s.service_type == "KYC":
             u = db.query(models.User).filter(models.User.id == s.customer_id).first()
-            u.video_kyc_status = "verified"
+            if u: u.video_kyc_status = "verified"
     s.status = "completed" if req.status == "approved" else "rejected"
     db.commit(); return {"message": "Success"}
 
