@@ -53,7 +53,8 @@ class Ticket(Base):
     customer_id = Column(Integer, ForeignKey("users.id"))
     subject = Column(String)
     description = Column(Text)
-    status = Column(String, default="open") 
+    status = Column(String, default="open") # open, resolved
+    agent_feedback = Column(Text, nullable=True) # NEW: Feedback from Agent
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class KYCSession(Base):
@@ -80,3 +81,9 @@ class OTPTracker(Base):
     identifier = Column(String, index=True)
     otp_code = Column(String)
     expires_at = Column(DateTime)
+
+class TokenBlacklist(Base):
+    __tablename__ = "token_blacklist"
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String, unique=True, index=True)
+    blacklisted_at = Column(DateTime, default=datetime.utcnow)

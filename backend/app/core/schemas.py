@@ -5,11 +5,11 @@ from datetime import datetime
 class Token(BaseModel):
     access_token: str
     token_type: str
+    role: str # Server returns the true role here
 
 class UserLogin(BaseModel):
     identifier: str
     mpin: str = Field(..., min_length=4, max_length=6)
-    role: str
 
 class SetMPIN(BaseModel):
     mpin: str = Field(..., min_length=4, max_length=6)
@@ -53,6 +53,11 @@ class LoanApply(BaseModel):
 class TicketCreate(BaseModel):
     subject: str
     description: str
+
+class TicketResolve(BaseModel):
+    ticket_id: int
+    feedback: str
+    status: str = "resolved"
 
 # --- Decisions & Admin ---
 class ServiceDecision(BaseModel):
